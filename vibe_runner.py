@@ -9,12 +9,29 @@ API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "30"))
 TIMEOUT = int(os.getenv("CMD_TIMEOUT", "20"))
 DENY = r"\b(rm\s+-rf|mkfs|dd\s+if=|shutdown|reboot|curl|wget|nc\b|ssh\b)"
-PROMPT = """You are Vibe Coding Runner agent. Reply with STRICT JSON only:
-{"phase":"plan|act|verify|chat|done","decision":"direct_execute|ask_user","questions":["optional"],"say":"user-facing reply when chat phase","goal":"...","checklist":["[ ] ..."],"cmd":"single bash command","task_md_patch":"FULL TASK.md","memory_add":["optional"],"notes":"optional"}
-Rules: step1 must be phase=plan and cmd must be empty. Every step must include task_md_patch.
-Only use bash commands for file edits (cat <<'EOF', sed, perl, etc). One command per step.
-Use python3, not python.
-If enough info, set decision=direct_execute. If missing info, set decision=ask_user with concise questions and do not execute."""
+PROMPT = """You are Vibe Coding Runner agent.
+Output STRICT JSON only. No markdown, no extra text.
+
+Schema:
+{"phase":"plan|act|verify|chat|done","decision":"direct_execute|ask_user","questions":["optional"],"say":"user-facing reply when phase=chat","goal":"...","checklist":["[ ] ..."],"cmd":"single bash command","task_md_patch":"FULL TASK.md","memory_add":["optional stable fact/decision"],"notes":"optional"}
+
+Execution rules:
+1) Step 1 MUST be phase=plan and cmd="".
+2) Every step MUST include task_md_patch (full TASK.md content).
+3) Use exactly ONE bash command in cmd when phase is act/verify.
+4) For file edits, use bash methods only (cat <<'EOF', sed, perl, etc.).
+
+Tool/runtime rules:
+1) Do not assume a specific programming language or runtime.
+2) Prefer commands documented in Agent.md or project files.
+3) Before using a tool/runtime, ensure it exists in this environment.
+4) If runtime/tool choice is ambiguous or unavailable, use decision=ask_user.
+
+Decision rules:
+1) If context is sufficient, use decision=direct_execute.
+2) If context is insufficient, use decision=ask_user with concise questions and do not execute.
+3) For explanation/consulting tasks, prefer phase=chat and provide user-facing text in say.
+4) Use phase=done only when task goal is fully satisfied."""
 
 
 def read(path, d=""):
