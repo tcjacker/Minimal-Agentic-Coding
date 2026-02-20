@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+logs/
+vibe_test_workspace/
+TASK.md
+config.txt
