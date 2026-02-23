@@ -47,9 +47,9 @@ Decision rules:
 
 Init rules:
 1) In phase=init, build/update Agent.md from project evidence (README, directory, git state, existing Agent.md).
-2) Agent.md should include: project overview, environment setup, build/test commands, coding rules, structure hints, safety.
+2) Agent.md should include: project goal, git status, structure, run/test commands, coding style, constraints.
 3) After init, continue with plan/act/verify.
-4) Prefer init when project context is stale, but do not block the run if init is skipped."""
+4) If runner says project_context_ok=false, you must do phase=init before other phases."""
 
 
 def read(path, d=""):
@@ -140,38 +140,20 @@ def project_summary(goal):
 def bootstrap_agent_md(goal):
     if os.path.exists("Agent.md") and read("Agent.md").strip():
         return
+    summary = project_summary(goal)
     write(
         "Agent.md",
-        "# Project Overview\n"
-        "This is a TypeScript REST API backend with user auth.\n\n"
-        "## Environment Setup\n"
-        "- pnpm install\n"
-        "- node >= 18\n\n"
-        "## Build & Dev\n"
-        "- pnpm dev\n"
-        "- pnpm build\n\n"
-        "## Testing\n"
-        "- pnpm test\n"
-        "- pnpm lint\n"
-        "- pnpm format\n\n"
-        "## Coding Rules\n"
-        "### Do\n"
-        "- Strict TS\n"
-        "- Write unit tests for new features\n\n"
-        "### Don't\n"
-        "- Hardcode credentials\n"
-        "- Skip tests\n\n"
-        "## Structure Hints\n"
-        "- Controllers: src/controllers\n"
-        "- Models: src/models\n"
-        "- Tests: tests/\n\n"
-        "## Safety\n"
-        "Allowed:\n"
-        "- search files\n"
-        "- run tests\n"
-        "Ask before:\n"
-        "- install deps\n"
-        "- modify prod configs\n",
+        "# Agent.md\n\n"
+        "## Project Goal\n"
+        f"- {goal}\n\n"
+        "## Project Snapshot\n"
+        f"{summary}\n"
+        "## Run/Test Commands\n"
+        "- Fill after init\n\n"
+        "## Coding Style\n"
+        "- Keep edits minimal and reviewable\n\n"
+        "## Constraints\n"
+        "- Prefer local commands and deterministic checks\n",
     )
 
 
@@ -181,12 +163,12 @@ def project_context_status():
         return False, "Agent.md missing/empty"
     low = text.lower()
     checks = [
-        any(k in low for k in ("project overview", "overview", "项目概览")),
-        any(k in low for k in ("build", "dev", "run", "pnpm", "test", "lint", "format")),
-        any(k in low for k in ("coding rules", "do", "don't", "strict", "tests")),
-        any(k in low for k in ("safety", "allowed", "ask before", "constraints", "约束")),
-    ]
-    placeholder = False
+        any(k in low for k in ("goal", "purpose", "目标")),
+        any(k in low for k in ("structure", "directory", "目录")),
+        any(k in low for k in ("run", "test", "build", "verify", "command", "命令")),
+        any(k in low for k in ("constraint", "rule", "no network", "限制", "约束")),
+    ] 
+    placeholder = "fill after init" in low
     score = sum(1 for x in checks if x)
     ok = (score >= 3) and (not placeholder)
     reason = f"score={score}/4; placeholder={'yes' if placeholder else 'no'}"
@@ -297,11 +279,11 @@ def control_console(msgs, log_path):
             append(log_path, "control=resume\n")
             print("action=resume")
             return msgs, False
-        if raw in ("done", "d", "quit", "q", "exit"):
+        if raw in ("quit", "q", "exit"):
             c = input("confirm quit? [y/N] ").strip().lower()
             if c in ("y", "yes"):
-                append(log_path, f"control={'done' if raw in ('done','d') else 'quit'}\n")
-                print(f"action={'done' if raw in ('done','d') else 'quit'}")
+                append(log_path, "control=quit\n")
+                print("action=quit")
                 return msgs, True
             print("action=cancel_quit")
             continue
@@ -412,10 +394,7 @@ def chat_console(say, msgs, log_path):
         if raw in ("resume", "r"):
             append(log_path, "chat=resume\n")
             return msgs, "resume"
-        if raw in ("done", "d"):
-            append(log_path, "chat=done\n")
-            return msgs, "done"
-        if raw in ("quit", "q", "exit"):
+        if raw in ("quit", "q", "exit", "done"):
             append(log_path, "chat=quit\n")
             return msgs, "quit"
         if raw.startswith("feedback "):
@@ -455,6 +434,7 @@ def main():
     summary = project_summary(goal)
     scratch = read(SCRATCH_FILE, "")[:8000]
     context_ok, context_reason = project_context_status()
+    must_init = not context_ok
     append(log_path, f"workspace_files:\n{file_list}\n")
     append(log_path, f"project_context_ok={context_ok}; reason={context_reason}\n")
     msgs = [
@@ -507,6 +487,16 @@ def main():
         if phase not in ("init", "plan", "act", "verify", "chat", "done"):
             append(log_path, f"error=invalid phase: {phase}\n")
             print(f"invalid phase: {phase}"); return
+        if must_init and phase != "init":
+            append(log_path, f"warning=project_context_not_ready blocked phase={phase}\n")
+            print("warning: project_context_ok=false, init required. retrying...")
+            msgs += [
+                {"role": "assistant", "content": json.dumps(r, ensure_ascii=False)},
+                {"role": "user", "content":
+                    "Invalid output: project_context_ok=false. You MUST run phase=init first "
+                    "with a command that initializes/updates Agent.md from project evidence."}
+            ]
+            continue
         if decision not in ("direct_execute", "ask_user"):
             append(log_path, f"error=invalid decision: {decision}\n")
             print(f"invalid decision: {decision}"); return
@@ -529,8 +519,8 @@ def main():
             write("TASK.md", patch)
             msgs += [{"role": "assistant", "content": json.dumps(r, ensure_ascii=False)}]
             msgs, action = chat_console(say or r.get("notes", ""), msgs, log_path)
-            if action in ("done", "quit"):
-                print("DONE (user confirmed)" if action == "done" else "QUIT")
+            if action == "quit":
+                print("QUIT")
                 return
             continue
         if decision == "ask_user":
@@ -543,8 +533,8 @@ def main():
                     print("QUIT")
                     return
                 continue
-            if ans.lower() in ("done", "d", "quit", "q", "exit"):
-                print("DONE (user confirmed)" if ans.lower() in ("done", "d") else "QUIT")
+            if ans.lower() in ("quit", "q", "exit"):
+                print("QUIT")
                 return
             msgs += [
                 {"role": "assistant", "content": json.dumps(r, ensure_ascii=False)},
@@ -583,6 +573,7 @@ def main():
         append(log_path, f"phase={phase}\ncmd={cmd}\nexit_code={res['code']}\noutput:\n{out}\n")
         if phase == "init":
             context_ok, context_reason = project_context_status()
+            must_init = not context_ok
             append(log_path, f"project_context_ok={context_ok}; reason={context_reason}\n")
         update_session_summary(step, phase, cmd, out, decision, notes)
         print(f"\n== step {step} {phase} ==\ncmd: {cmd or '(none)'}\n{out[-1200:]}")
