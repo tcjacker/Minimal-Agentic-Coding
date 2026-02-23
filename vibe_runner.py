@@ -8,18 +8,30 @@ BASE_URL = os.getenv("BASE_URL", "https://api.openai.com/v1")
 API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "30"))
 TIMEOUT = int(os.getenv("CMD_TIMEOUT", "20"))
+OUTPUT_LIMIT = int(os.getenv("OUTPUT_LIMIT", "12000"))
+PAGE_LINES = int(os.getenv("PAGE_LINES", "120"))
+SCRATCH_FILE = os.getenv("SCRATCH_FILE", ".agent_scratch.md")
+SESSION_SUMMARY_FILE = os.getenv("SESSION_SUMMARY_FILE", ".session_summary.md")
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "12"))
+MAX_AGENT_INJECT = int(os.getenv("MAX_AGENT_INJECT", "8000"))
+MAX_SCRATCH_INJECT = int(os.getenv("MAX_SCRATCH_INJECT", "4000"))
+SUMMARY_EVERY = int(os.getenv("SUMMARY_EVERY", "3"))
 DENY = r"\b(rm\s+-rf|mkfs|dd\s+if=|shutdown|reboot|curl|wget|nc\b|ssh\b)"
 PROMPT = """You are Vibe Coding Runner agent.
 Output STRICT JSON only. No markdown, no extra text.
 
 Schema:
-{"phase":"plan|act|verify|chat|done","decision":"direct_execute|ask_user","questions":["optional"],"say":"user-facing reply when phase=chat","goal":"...","checklist":["[ ] ..."],"cmd":"single bash command","task_md_patch":"FULL TASK.md","memory_add":["optional stable fact/decision"],"notes":"optional"}
+{"phase":"init|plan|act|verify|chat|done","decision":"direct_execute|ask_user","questions":["optional"],"say":"user-facing reply when phase=chat","goal":"...","checklist":["[ ] ..."],"cmd":"single bash command","task_md_patch":"FULL TASK.md","memory_add":["optional stable fact/decision"],"notes":"optional"}
 
 Execution rules:
-1) Step 1 MUST be phase=plan and cmd="".
+1) Prefer phase=init when project context is missing/stale; do not force it every run.
 2) Every step MUST include task_md_patch (full TASK.md content).
-3) Use exactly ONE bash command in cmd when phase is act/verify.
+3) Use exactly ONE bash command in cmd when phase is init/act/verify.
 4) For file edits, use bash methods only (cat <<'EOF', sed, perl, etc.).
+5) For long files, read by pagination across multiple steps. Recommended:
+   nl -ba <file> | sed -n '<start>,<end>p'
+   where window size defaults to PAGE_LINES from context.
+6) Use SCRATCH_FILE for temporary notes and intermediate findings. You may append/update it using bash.
 
 Tool/runtime rules:
 1) Do not assume a specific programming language or runtime.
@@ -31,7 +43,13 @@ Decision rules:
 1) If context is sufficient, use decision=direct_execute.
 2) If context is insufficient, use decision=ask_user with concise questions and do not execute.
 3) For explanation/consulting tasks, prefer phase=chat and provide user-facing text in say.
-4) Use phase=done only when task goal is fully satisfied."""
+4) Use phase=done only when task goal is fully satisfied.
+
+Init rules:
+1) In phase=init, build/update Agent.md from project evidence (README, directory, git state, existing Agent.md).
+2) Agent.md should include: project overview, environment setup, build/test commands, coding rules, structure hints, safety.
+3) After init, continue with plan/act/verify.
+4) Prefer init when project context is stale, but do not block the run if init is skipped."""
 
 
 def read(path, d=""):
@@ -54,7 +72,12 @@ def run(cmd):
         return {"code": 126, "output": "[blocked by denylist]"}
     try:
         p = subprocess.run(cmd, shell=True, text=True, capture_output=True, timeout=TIMEOUT)
-        return {"code": p.returncode, "output": (p.stdout + p.stderr)[-6000:]}
+        out = p.stdout + p.stderr
+        if len(out) <= OUTPUT_LIMIT:
+            return {"code": p.returncode, "output": out}
+        head = out[:OUTPUT_LIMIT // 2]
+        tail = out[-OUTPUT_LIMIT // 2:]
+        return {"code": p.returncode, "output": f"{head}\n...[truncated]...\n{tail}"}
     except subprocess.TimeoutExpired:
         return {"code": 124, "output": "[command timeout]"}
 
@@ -92,6 +115,133 @@ def file_previews(files):
         except Exception:
             out.append(f"\n### {p}\n(unreadable)")
     return "\n".join(out)
+
+
+def project_summary(goal):
+    inside = run("git rev-parse --is-inside-work-tree")
+    git_state = "yes" if inside["code"] == 0 else "no"
+    branch = run("git branch --show-current")["output"].strip() if git_state == "yes" else ""
+    readme = read("README.md", "")
+    readme_cn = read("readme.md", "")
+    agent = read("Agent.md", "")
+    files_text, files = file_inventory()
+    top = ", ".join(files[:12]) if files else "(none)"
+    return (
+        f"Project goal: {goal}\n"
+        f"Git repo: {git_state}\n"
+        f"Git branch: {branch or '(n/a)'}\n"
+        f"Top files: {top}\n"
+        f"Has Agent.md: {'yes' if agent else 'no'}\n"
+        f"Has README: {'yes' if (readme or readme_cn) else 'no'}\n"
+        f"Existing files list:\n{files_text}\n"
+    )
+
+
+def bootstrap_agent_md(goal):
+    if os.path.exists("Agent.md") and read("Agent.md").strip():
+        return
+    write(
+        "Agent.md",
+        "# Project Overview\n"
+        "This is a TypeScript REST API backend with user auth.\n\n"
+        "## Environment Setup\n"
+        "- pnpm install\n"
+        "- node >= 18\n\n"
+        "## Build & Dev\n"
+        "- pnpm dev\n"
+        "- pnpm build\n\n"
+        "## Testing\n"
+        "- pnpm test\n"
+        "- pnpm lint\n"
+        "- pnpm format\n\n"
+        "## Coding Rules\n"
+        "### Do\n"
+        "- Strict TS\n"
+        "- Write unit tests for new features\n\n"
+        "### Don't\n"
+        "- Hardcode credentials\n"
+        "- Skip tests\n\n"
+        "## Structure Hints\n"
+        "- Controllers: src/controllers\n"
+        "- Models: src/models\n"
+        "- Tests: tests/\n\n"
+        "## Safety\n"
+        "Allowed:\n"
+        "- search files\n"
+        "- run tests\n"
+        "Ask before:\n"
+        "- install deps\n"
+        "- modify prod configs\n",
+    )
+
+
+def project_context_status():
+    text = read("Agent.md", "").strip()
+    if not text:
+        return False, "Agent.md missing/empty"
+    low = text.lower()
+    checks = [
+        any(k in low for k in ("project overview", "overview", "项目概览")),
+        any(k in low for k in ("build", "dev", "run", "pnpm", "test", "lint", "format")),
+        any(k in low for k in ("coding rules", "do", "don't", "strict", "tests")),
+        any(k in low for k in ("safety", "allowed", "ask before", "constraints", "约束")),
+    ]
+    placeholder = False
+    score = sum(1 for x in checks if x)
+    ok = (score >= 3) and (not placeholder)
+    reason = f"score={score}/4; placeholder={'yes' if placeholder else 'no'}"
+    return ok, reason
+
+
+def ensure_scratch(reset=True):
+    if os.path.exists(SCRATCH_FILE) and not reset:
+        return
+    write(
+        SCRATCH_FILE,
+        "# Agent Scratchpad\n\n"
+        "- Temporary working notes for this runner session only.\n"
+        "- Safe to overwrite/append.\n",
+    )
+
+
+def ensure_session_summary(reset=True):
+    if os.path.exists(SESSION_SUMMARY_FILE) and not reset:
+        return
+    write(
+        SESSION_SUMMARY_FILE,
+        "# Session Summary\n\n"
+        "## Goal\n"
+        "- (pending)\n\n"
+        "## Completed\n"
+        "- (none)\n\n"
+        "## Decisions\n"
+        "- (none)\n\n"
+        "## Open Items\n"
+        "- (none)\n",
+    )
+
+
+def clip(text, n):
+    return text if len(text) <= n else text[:n] + "\n...[truncated]..."
+
+
+def build_llm_messages(msgs, summary_text):
+    base = msgs[:2]
+    tail = msgs[2:]
+    keep = HISTORY_TURNS * 2
+    recent = tail[-keep:] if keep > 0 else tail
+    summary_msg = [{"role": "user", "content": f"Session summary (compressed):\n{clip(summary_text, 6000)}"}]
+    return base + summary_msg + recent
+
+
+def update_session_summary(step, phase, cmd, out, decision, notes):
+    if step % SUMMARY_EVERY != 0 and phase not in ("done",):
+        return
+    line = (
+        f"- Step {step}: phase={phase}, decision={decision}, "
+        f"cmd={cmd[:120] or '(none)'}, notes={clip(notes or '', 160).replace(chr(10), ' ')}"
+    )
+    append(SESSION_SUMMARY_FILE, f"\n{line}\n")
 
 
 def llm(messages):
@@ -147,11 +297,11 @@ def control_console(msgs, log_path):
             append(log_path, "control=resume\n")
             print("action=resume")
             return msgs, False
-        if raw in ("quit", "q", "exit"):
+        if raw in ("done", "d", "quit", "q", "exit"):
             c = input("confirm quit? [y/N] ").strip().lower()
             if c in ("y", "yes"):
-                append(log_path, "control=quit\n")
-                print("action=quit")
+                append(log_path, f"control={'done' if raw in ('done','d') else 'quit'}\n")
+                print(f"action={'done' if raw in ('done','d') else 'quit'}")
                 return msgs, True
             print("action=cancel_quit")
             continue
@@ -262,7 +412,10 @@ def chat_console(say, msgs, log_path):
         if raw in ("resume", "r"):
             append(log_path, "chat=resume\n")
             return msgs, "resume"
-        if raw in ("quit", "q", "exit", "done"):
+        if raw in ("done", "d"):
+            append(log_path, "chat=done\n")
+            return msgs, "done"
+        if raw in ("quit", "q", "exit"):
             append(log_path, "chat=quit\n")
             return msgs, "quit"
         if raw.startswith("feedback "):
@@ -286,8 +439,11 @@ def main():
     goal = " ".join(sys.argv[1:]).strip() or input("Goal> ").strip()
     os.makedirs("logs", exist_ok=True)
     log_path = f"logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    bootstrap_agent_md(goal)
+    ensure_scratch(reset=True)
+    ensure_session_summary(reset=True)
     agent = read("Agent.md", "# Agent\n- Keep changes minimal\n")
-    write("TASK.md", f"# Task Log\n\n## Goal\n- {goal}\n\n## Checklist\n- [ ] Plan\n")
+    write("TASK.md", f"# Task Log\n\n## Goal\n- {goal}\n\n## Checklist\n- [ ] Init\n- [ ] Plan\n")
     write(
         log_path,
         f"# Vibe Runner Log\nstarted_at={datetime.now().isoformat()}\n"
@@ -296,18 +452,46 @@ def main():
     print(f"log file: {log_path}")
     file_list, files = file_inventory()
     previews = file_previews(files)
+    summary = project_summary(goal)
+    scratch = read(SCRATCH_FILE, "")[:8000]
+    context_ok, context_reason = project_context_status()
     append(log_path, f"workspace_files:\n{file_list}\n")
+    append(log_path, f"project_context_ok={context_ok}; reason={context_reason}\n")
     msgs = [
         {"role": "system", "content": PROMPT},
         {"role": "user", "content":
             f"Goal: {goal}\n\nWorking directory: {os.getcwd()}\n\n"
+            f"Context config:\n- PAGE_LINES={PAGE_LINES}\n- SCRATCH_FILE={SCRATCH_FILE}\n\n"
+            f"Project context:\n- project_context_ok={context_ok}\n- reason={context_reason}\n\n"
+            f"Project summary:\n{summary}\n\n"
             f"Existing files:\n{file_list}\n\n"
             f"Text previews:\n{previews}\n\n"
-            f"Agent.md:\n{agent}\n\nCurrent TASK.md:\n{read('TASK.md')}"}
+            f"Agent.md:\n{agent}\n\n"
+            f"Scratch ({SCRATCH_FILE}):\n{scratch}\n\n"
+            f"Current TASK.md:\n{read('TASK.md')}"}
     ]
+    append(SESSION_SUMMARY_FILE, f"\n## Goal\n- {goal}\n")
+    last_agent_seen = None
+    last_scratch_seen = None
     for step in range(1, MAX_STEPS + 1):
+        current_agent = read("Agent.md", "(missing)")
+        current_scratch = read(SCRATCH_FILE, "(missing)")
+        inject_parts = []
+        if current_agent != last_agent_seen:
+            inject_parts.append(
+                f"Latest Agent.md (always authoritative):\n{clip(current_agent, MAX_AGENT_INJECT)}"
+            )
+            last_agent_seen = current_agent
+        if current_scratch != last_scratch_seen:
+            inject_parts.append(
+                f"Latest Scratch ({SCRATCH_FILE}):\n{clip(current_scratch, MAX_SCRATCH_INJECT)}"
+            )
+            last_scratch_seen = current_scratch
+        if inject_parts:
+            msgs.append({"role": "user", "content": "\n\n".join(inject_parts)})
+        llm_msgs = build_llm_messages(msgs, read(SESSION_SUMMARY_FILE, ""))
         try:
-            r = llm(msgs)
+            r = llm(llm_msgs)
         except KeyboardInterrupt:
             msgs, should_quit = control_console(msgs, log_path)
             if should_quit:
@@ -318,15 +502,14 @@ def main():
         decision = (r.get("decision") or "direct_execute").strip()
         questions = r.get("questions") or []
         say = (r.get("say") or "").strip()
+        notes = (r.get("notes") or "").strip()
         append(log_path, f"\n## step {step}\nresponse={json.dumps(r, ensure_ascii=False)}\n")
-        if phase not in ("plan", "act", "verify", "chat", "done"):
+        if phase not in ("init", "plan", "act", "verify", "chat", "done"):
             append(log_path, f"error=invalid phase: {phase}\n")
             print(f"invalid phase: {phase}"); return
         if decision not in ("direct_execute", "ask_user"):
             append(log_path, f"error=invalid decision: {decision}\n")
             print(f"invalid decision: {decision}"); return
-        if step == 1 and phase != "plan":
-            print("step1 must be plan"); return
         if patch is None:
             print("task_md_patch required"); return
         if phase == "done":
@@ -335,6 +518,7 @@ def main():
             msgs += [{"role": "assistant", "content": json.dumps(r, ensure_ascii=False)}]
             msgs, action = post_verify_console(msgs, log_path, mode="done")
             if action == "done":
+                update_session_summary(step, phase, cmd, "", decision, notes)
                 print("DONE (user confirmed)")
                 return
             if action == "quit":
@@ -345,8 +529,8 @@ def main():
             write("TASK.md", patch)
             msgs += [{"role": "assistant", "content": json.dumps(r, ensure_ascii=False)}]
             msgs, action = chat_console(say or r.get("notes", ""), msgs, log_path)
-            if action == "quit":
-                print("QUIT")
+            if action in ("done", "quit"):
+                print("DONE (user confirmed)" if action == "done" else "QUIT")
                 return
             continue
         if decision == "ask_user":
@@ -359,12 +543,15 @@ def main():
                     print("QUIT")
                     return
                 continue
-            if ans.lower() in ("quit", "q", "exit"):
-                print("QUIT")
+            if ans.lower() in ("done", "d", "quit", "q", "exit"):
+                print("DONE (user confirmed)" if ans.lower() in ("done", "d") else "QUIT")
                 return
             msgs += [
                 {"role": "assistant", "content": json.dumps(r, ensure_ascii=False)},
-                {"role": "user", "content": f"Human answer: {ans}\nCurrent TASK.md:\n{read('TASK.md')}"}
+                {"role": "user", "content":
+                    f"Human answer: {ans}\n\nLatest Agent.md:\n{read('Agent.md', '(missing)')[:12000]}"
+                    f"\n\nLatest Scratch ({SCRATCH_FILE}):\n{read(SCRATCH_FILE, '(missing)')[:8000]}"
+                    f"\n\nCurrent TASK.md:\n{read('TASK.md')}"}
             ]
             continue
         if phase == "plan" and cmd.strip():
@@ -375,7 +562,7 @@ def main():
                 {"role": "user", "content": "Invalid output: phase=plan must have empty cmd. Please emit a valid next JSON step."}
             ]
             continue
-        if phase in ("act", "verify") and not cmd.strip():
+        if phase in ("init", "act", "verify") and not cmd.strip():
             append(log_path, f"warning=missing cmd in {phase}; requested retry\n")
             print(f"warning: {phase} step missing command, retrying...")
             msgs += [
@@ -385,7 +572,7 @@ def main():
             continue
         write("TASK.md", patch)
         try:
-            res = run(cmd) if phase in ("act", "verify") else {"code": 0, "output": "[planning]"}
+            res = run(cmd) if phase in ("init", "act", "verify") else {"code": 0, "output": "[planning]"}
         except KeyboardInterrupt:
             msgs, should_quit = control_console(msgs, log_path)
             if should_quit:
@@ -394,6 +581,10 @@ def main():
             continue
         out = f"[exit_code]\n{res['code']}\n{res['output']}" + git_snapshot()
         append(log_path, f"phase={phase}\ncmd={cmd}\nexit_code={res['code']}\noutput:\n{out}\n")
+        if phase == "init":
+            context_ok, context_reason = project_context_status()
+            append(log_path, f"project_context_ok={context_ok}; reason={context_reason}\n")
+        update_session_summary(step, phase, cmd, out, decision, notes)
         print(f"\n== step {step} {phase} ==\ncmd: {cmd or '(none)'}\n{out[-1200:]}")
         if phase == "verify" and cmd.strip() and res["code"] == 0:
             msgs, action = post_verify_console(msgs, log_path)
@@ -407,6 +598,8 @@ def main():
             {"role": "assistant", "content": json.dumps(r, ensure_ascii=False)},
             {"role": "user", "content":
                 f"command_output:\n{out}\n\nExisting files now:\n{file_inventory()[0]}"
+                f"\n\nAgent.md now:\n{read('Agent.md', '(missing)')[:12000]}"
+                f"\n\nScratch now ({SCRATCH_FILE}):\n{read(SCRATCH_FILE, '(missing)')[:8000]}"
                 f"\n\nCurrent TASK.md:\n{read('TASK.md')}"}
         ]
     append(log_path, "status=MAX_STEPS exceeded\n")
